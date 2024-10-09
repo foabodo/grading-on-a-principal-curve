@@ -6,7 +6,7 @@ import pymc as pm
 import pytensor.tensor as pt
 from ranking_dataset import RankingDataset
 from typing import List
-from mixture import HurdleOrderedLogistic, ZeroInflatedOrderedLogistic, OrderedLogistic
+from hurdle_ordered_logistic import HurdleOrderedLogistic, ZeroInflatedOrderedLogistic, OrderedLogistic
 import xarray as xr
 
 

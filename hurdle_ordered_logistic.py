@@ -3,6 +3,7 @@ import pymc as pm
 from pymc.distributions.distribution import Discrete
 from pymc.distributions.dist_math import check_parameters
 from pymc.distributions.shape_utils import rv_size_is_none
+from pymc.math import sigmoid
 import pytensor.tensor as pt
 from pytensor.tensor import TensorConstant
 from pytensor.tensor.random.basic import vsearchsorted
@@ -10,8 +11,9 @@ from pytensor.tensor.random.op import RandomVariable
 import warnings
 
 
-class CategoricalRV(RandomVariable):
-    r"""A categorical discrete random variable.
+class OrderedCategoricalRV(RandomVariable):
+    r"""An ordered categorical discrete random variable to support 
+    HurdleOrderedLogistic by incorporating a logcdf function.
 
     The probability mass function of `categorical` in terms of its :math:`N` event
     probabilities :math:`p_1, \dots, p_N` is:
@@ -24,13 +26,13 @@ class CategoricalRV(RandomVariable):
 
     """
 
-    name = "categorical"
-    signature = "(p)->()"
+    name = "ordered_categorical"
+    signature = "(p_cum)->()"
     dtype = "int64"
-    _print_name = ("Categorical", "\\operatorname{Categorical}")
+    _print_name = ("OrderedCategorical", "\\operatorname{OrderedCategorical}")
 
-    def __call__(self, p, size=None, **kwargs):
-        r"""Draw samples from a discrete categorical distribution.
+    def __call__(self, p_cum, size=None, **kwargs):
+        r"""Draw samples from an ordinal discrete categorical distribution.
 
         Signature
         ---------
@@ -48,31 +50,33 @@ class CategoricalRV(RandomVariable):
             is returned.
 
         """
-        return super().__call__(p, size=size, **kwargs)
+        return super().__call__(p_cum, size=size, **kwargs)
+
 
     @classmethod
-    def rng_fn(cls, rng, p, size):
+    def rng_fn(cls, rng, p_cum, size):
+        p_cum = p_cum[..., 1:]
+
         if size is None:
-            size = p.shape[:-1]
+            size = p_cum.shape[:-1]
         else:
             # Check that `size` does not define a shape that would be broadcasted
             # to `p.shape[:-1]` in the call to `vsearchsorted` below.
-            if len(size) < (p.ndim - 1):
-                raise ValueError("`size` is incompatible with the shape of `p`")
-            for s, ps in zip(reversed(size), reversed(p.shape[:-1])):
+            if len(size) < (p_cum.ndim - 1):
+                raise ValueError("`size` is incompatible with the shape of `p_cum`")
+            for s, ps in zip(reversed(size), reversed(p_cum.shape[:-1])):
                 if s == 1 and ps != 1:
-                    raise ValueError("`size` is incompatible with the shape of `p`")
+                    raise ValueError("`size` is incompatible with the shape of `p_cum`")
 
         unif_samples = rng.uniform(size=size)
-        samples = vsearchsorted(p.cumsum(axis=-1), unif_samples)
+        samples = vsearchsorted(p_cum, unif_samples)
 
         return samples
 
 
-categorical = CategoricalRV()
+ordered_categorical = OrderedCategoricalRV()
 
-
-class Categorical(Discrete):
+class OrderedCategorical(Discrete):
     R"""
     Categorical log-likelihood.
 
@@ -104,30 +108,22 @@ class Categorical(Discrete):
 
     Parameters
     ----------
-    p : array of floats
-        p > 0 and the elements of p must sum to 1.
-    logit_p : float
-        Alternative log odds for the probability of success.
+    p_cum : array of floats
+        p_cum[0] == 0, p_cum[-1] == 1, and the elements of 
+        p_cum[..., 1:] - p_cum[..., :-1] must increase
+        monotonically and sum to 1.
     """
 
-    rv_op = categorical
+    rv_op = ordered_categorical
 
     @classmethod
-    def dist(cls, p=None, logit_p=None, **kwargs):
-        if p is not None and logit_p is not None:
-            raise ValueError("Incompatible parametrization. Can't specify both p and logit_p.")
-        elif p is None and logit_p is None:
-            raise ValueError("Incompatible parametrization. Must specify either p or logit_p.")
-
-        if logit_p is not None:
-            p = pm.math.softmax(logit_p, axis=-1)
-
-        p = pt.as_tensor_variable(p)
-        if isinstance(p, TensorConstant):
-            p_ = np.asarray(p.data)
-            if np.any(p_ < 0):
-                raise ValueError(f"Negative `p` parameters are not valid, got: {p_}")
-            p_sum_ = np.sum([p_], axis=-1)
+    def dist(cls, p_cum=None, **kwargs):
+        p_cum = pt.as_tensor_variable(p_cum)
+        if isinstance(p_cum, TensorConstant):
+            p_cum_ = np.asarray(p_cum.data)
+            if np.any(p_cum_ < 0):
+                raise ValueError(f"Negative `p` parameters are not valid, got: {p_cum_}")
+            p_sum_ = p_cum_[..., -1]
             if not np.all(np.isclose(p_sum_, 1.0)):
                 warnings.warn(
                     f"`p` parameters sum to {p_sum_}, instead of 1.0. "
@@ -135,17 +131,19 @@ class Categorical(Discrete):
                     "You can rescale them directly to get rid of this warning.",
                     UserWarning,
                 )
-                p_ = p_ / pt.sum(p_, axis=-1, keepdims=True)
-                p = pt.as_tensor_variable(p_)
-        return super().dist([p], **kwargs)
+                p_cum_ = p_cum_ / pt.true_div(p_sum_, axis=-1, keepdims=True)
+                p_cum = pt.as_tensor_variable(p_cum_)
+        return super().dist([p_cum], **kwargs)
 
-    def support_point(rv, size, p):
+    def support_point(rv, size, p_cum):
+        p = p_cum[..., 1:] - p_cum[..., :-1]
         mode = pt.argmax(p, axis=-1)
         if not rv_size_is_none(size):
             mode = pt.full(size, mode)
         return mode
 
-    def logp(value, p):
+    def logp(value, p_cum):
+        p = p_cum[..., 1:] - p_cum[..., :-1]
         k = pt.shape(p)[-1]
         value_clip = pt.clip(value, 0, k - 1)
 
@@ -172,6 +170,38 @@ class Categorical(Discrete):
             p <= 1,
             pt.isclose(pt.sum(p, axis=-1), 1),
             msg="0 <= p <=1, sum(p) = 1",
+        )
+    
+    def logcdf(value, p_cum):
+        p_cum = p_cum[..., 1:]
+        k = pt.shape(p_cum)[-1]
+
+        value = pt.cast(value, "int32")
+        value_clip = pt.clip(value, 0, k - 1)
+
+        # In the standard case p has one more dimension than value
+        dim_diff = p_cum.type.ndim - value.type.ndim
+        if dim_diff > 1:
+            # p brodacasts implicitly beyond value
+            value_clip = pt.shape_padleft(value_clip, dim_diff - 1)
+        elif dim_diff < 1:
+            # value broadcasts implicitly beyond p
+            p_cum = pt.shape_padleft(p_cum, 1 - dim_diff)
+
+        a = pt.log(pt.take_along_axis(p_cum, value_clip[..., None], axis=-1).squeeze(-1))
+        
+        res = pt.switch(
+            pt.or_(pt.lt(value, 0), pt.gt(value, k - 1)),
+            -np.inf,
+            a,
+        )
+
+        return check_parameters(
+            res,
+            0 <= p_cum,
+            p_cum <= 1,
+            pt.isclose(p_cum[..., -1], 1),
+            msg="0 <= p_cum <= 1",
         )
 
 class OrderedLogistic:
@@ -243,16 +273,16 @@ class OrderedLogistic:
     """
 
     def __new__(cls, name, eta, cutpoints, compute_p=True, **kwargs):
-        p = cls.compute_p(eta, cutpoints)
+        p_cum = cls.compute_p(eta, cutpoints)
         if compute_p:
-            p = pm.Deterministic(f"{name}_probs", p)
-        out_rv = Categorical(name, p=p, **kwargs)
+            p_cum = pm.Deterministic(f"{name}_cum_probs", p_cum)
+        out_rv = OrderedCategorical(name, p_cum=p_cum, **kwargs)
         return out_rv
 
     @classmethod
     def dist(cls, eta, cutpoints, **kwargs):
-        p = cls.compute_p(eta, cutpoints)
-        return Categorical.dist(p=p, **kwargs)
+        p_cum = cls.compute_p(eta, cutpoints)
+        return OrderedCategorical.dist(p_cum=p_cum, **kwargs)
 
     @classmethod
     def compute_p(cls, eta, cutpoints):
@@ -268,5 +298,20 @@ class OrderedLogistic:
             ],
             axis=-1,
         )
-        p = p_cum[..., 1:] - p_cum[..., :-1]
-        return p
+        return p_cum
+    
+
+class HurdleOrderedLogistic:
+    R"""
+    Hurdle OrderedLogistic log-likelihood.
+    """
+
+    def __new__(cls, name, psi, eta, cutpoints, observed, max_n_steps=10_000):
+        nonzero_p = pt.as_tensor_variable(psi)
+        weights = pt.stack([1 - nonzero_p, nonzero_p], axis=-1)
+        nonzero_dist = OrderedLogistic.dist(eta=eta, cutpoints=cutpoints)
+        comp_dists = [
+            pm.DiracDelta.dist(0),
+            pm.Truncated.dist(nonzero_dist, lower=cutpoints[0], max_n_steps=max_n_steps)
+        ]
+        return pm.Mixture(name=name, w=weights, comp_dists=comp_dists, observed=observed)
